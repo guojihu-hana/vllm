@@ -160,10 +160,11 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_remote import DraftRemoteProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -519,6 +520,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DFlashProposer
                 | DraftModelProposer
+                | DraftRemoteProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
@@ -527,11 +529,18 @@ class GPUModelRunner(
 
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
-                self.drafter = DraftModelProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device,
-                    runner=self,
-                )
+                if self.speculative_config.remote_draft_enabled:
+                    self.drafter = DraftRemoteProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        runner=self,
+                    )
+                else:
+                    self.drafter = DraftModelProposer(
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        runner=self,
+                    )
             elif self.speculative_config.use_ngram_gpu():
                 self.drafter = NgramProposerGPU(self.vllm_config, self.device, self)
                 self.num_tokens_no_spec_gpu = torch.zeros(
@@ -4217,6 +4226,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
+                    | DraftRemoteProposer
                     | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
@@ -4478,6 +4488,61 @@ class GPUModelRunner(
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def gather_remote_draft_context_token_ids(self) -> list[list[int]]:
+        """Full per-request token sequences for remote draft greedy replay.
+
+        This runs during ``propose_draft_token_ids`` **before**
+        ``_bookkeeping_sync``, so ``output_token_ids`` / ``num_tokens_no_spec``
+        do not yet include this step's rejection-sampled tokens. When
+        :attr:`_remote_draft_propose_sampled_token_ids` is set (remote draft),
+        the tail is taken from that tensor using the same filtering as
+        :meth:`RejectionSampler.parse_output`. Conditioning on raw
+        ``spec_token_ids`` alone would keep unaccepted draft tokens and
+        misalign the small model with the target.
+
+        Without post-rejection samples, build prompt + output + scheduled
+        ``spec_token_ids``, with a rare fallback to ``token_ids_cpu``.
+        """
+        ib = self.input_batch
+        sampled = getattr(self, "_remote_draft_propose_sampled_token_ids", None)
+        out: list[list[int]] = []
+        num_reqs = ib.num_reqs
+        discard_np = self.discard_request_mask.np[:num_reqs]
+        vocab_size = ib.vocab_size
+        for i in range(num_reqs):
+            rid = ib.req_ids[i]
+            st = self.requests[rid]
+            if st.prompt_token_ids is None:
+                raise RuntimeError(
+                    "gather_remote_draft_context_token_ids: remote draft needs "
+                    f"materialized prompt_token_ids (req={rid}, prompt_embeds-only "
+                    "prompts are unsupported)."
+                )
+            base = list(st.prompt_token_ids) + list(st.output_token_ids)
+            discard = bool(discard_np[i])
+            if not discard and isinstance(sampled, torch.Tensor):
+                tail = [
+                    int(t)
+                    for t in sampled[i].tolist()
+                    if int(t) != PLACEHOLDER_TOKEN_ID and 0 <= int(t) < vocab_size
+                ]
+                seq = base + tail
+            elif not discard and isinstance(sampled, list) and i < len(sampled):
+                tail = [
+                    int(t)
+                    for t in sampled[i]
+                    if int(t) != PLACEHOLDER_TOKEN_ID and 0 <= int(t) < vocab_size
+                ]
+                seq = base + tail
+            else:
+                seq = base + list(ib.spec_token_ids[i])
+                expected = ib._get_active_token_count(i)
+                if len(seq) != expected:
+                    row = ib.token_ids_cpu[i, :expected]
+                    seq = [int(row[j]) for j in range(expected)]
+            out.append(seq)
+        return out
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4609,7 +4674,11 @@ class GPUModelRunner(
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer
+                | DFlashProposer
+                | DraftModelProposer
+                | DraftRemoteProposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -4707,7 +4776,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
+            propose_kwargs = dict(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -4719,7 +4788,15 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-
+            if isinstance(self.drafter, DraftRemoteProposer):
+                self._remote_draft_propose_sampled_token_ids = sampled_token_ids
+                try:
+                    draft_token_ids = self.drafter.propose(**propose_kwargs)
+                finally:
+                    self._remote_draft_propose_sampled_token_ids = None
+            else:
+                draft_token_ids = self.drafter.propose(**propose_kwargs)
+            # print(draft_token_ids, len(draft_token_ids), draft_token_ids.shape)
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -5507,6 +5584,7 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
+                    | DraftRemoteProposer
                     | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
@@ -6276,7 +6354,11 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer
+                | DFlashProposer
+                | DraftModelProposer
+                | DraftRemoteProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 

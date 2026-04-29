@@ -182,6 +182,20 @@ class SpeculativeConfig:
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
 
+    remote_draft_enabled: bool = False
+    """Whether to run draft model proposals on a remote worker service.
+    Currently only supported when method is ``draft_model``."""
+
+    remote_draft_endpoint: str | None = None
+    """Remote draft worker RPC endpoint.
+    Example: ``tcp://10.0.0.12:18861``."""
+
+    remote_draft_rpc_timeout_ms: int = Field(default=30000, gt=0)
+    """RPC timeout for draft remote worker requests."""
+
+    remote_draft_max_retries: int = Field(default=0, ge=0)
+    """Maximum retries for draft RPC calls."""
+
     rejection_sample_method: RejectionSampleMethod = "strict"
     """Whether to use strict (target and draft sampled tokens match exactly)
     or probabilistic rejection sampling. Both respect the target model
@@ -520,8 +534,11 @@ class SpeculativeConfig:
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
                     self.method = "mlp_speculator"
-                elif self.draft_model_config.hf_config.model_type in get_args(
-                    MTPModelTypes
+                elif (
+                    self.draft_model_config.hf_config.model_type in get_args(
+                        MTPModelTypes
+                    )
+                    and not self.remote_draft_enabled
                 ):
                     self.method = "mtp"
                     if self.num_speculative_tokens > 1:
@@ -530,6 +547,18 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
+                elif (
+                    self.draft_model_config.hf_config.model_type in get_args(
+                        MTPModelTypes
+                    )
+                    and self.remote_draft_enabled
+                ):
+                    logger.info(
+                        "remote_draft_enabled=True: keeping method='draft_model' "
+                        "even though draft checkpoint is MTP-style (%s); "
+                        "draft proposals are served remotely.",
+                        self.draft_model_config.hf_config.model_type,
+                    )
                 elif self.draft_model_config.hf_config.model_type in (
                     "longcat_flash_mtp"
                 ):
@@ -806,6 +835,18 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.remote_draft_enabled:
+            if self.method != "draft_model":
+                raise ValueError(
+                    "remote_draft_enabled currently only supports "
+                    "method='draft_model'."
+                )
+            if self.remote_draft_endpoint is None:
+                raise ValueError(
+                    "remote_draft_endpoint must be provided when "
+                    "remote_draft_enabled=True."
+                )
+
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
@@ -897,4 +938,8 @@ class SpeculativeConfig:
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
-        return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
+        remote_draft = self.remote_draft_enabled
+        return (
+            f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=}, "
+            f"{remote_draft=})"
+        )
