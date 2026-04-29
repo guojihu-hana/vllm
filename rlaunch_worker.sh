@@ -9,7 +9,7 @@ rlaunch --gpu=${GPU_NUM} \
     --memory=${MEMORY} \
     --private-machine=yes \
     --charged-group=stu \
-    --negative-tags node/gpu-lg-cmc-h-h200-1086.host.h.pjlab.org.cn \
+    --positive-tags node/gpu-lg-cmc-h-h200-2861.host.h.pjlab.org.cn \
     --mount=gpfs://gpfs1/ailab-sys/guojihu:/mnt/shared-storage-user/ailab-sys/guojihu \
     --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
     --image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/megatron:25.12-py3-nvshmem-tmux \

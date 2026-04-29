@@ -155,6 +155,9 @@ class VLLMGreedyDraftFn:
             self.max_seq_len,
             resolved_dtype,
         )
+        # Match draft_remote_native.build_vllm_config_for_native_remote_draft:
+        # VLLM_REMOTE_DRAFT_ENFORCE_EAGER=0 disables eager (allows compile/CUDAGraph).
+        _enforce_eager = os.environ.get("VLLM_REMOTE_DRAFT_ENFORCE_EAGER", "1") != "0"
         self._llm = LLM(
             model=model,
             tokenizer=model,
@@ -165,7 +168,7 @@ class VLLMGreedyDraftFn:
             gpu_memory_utilization=float(
                 os.environ.get("VLLM_REMOTE_DRAFT_GPU_MEMORY_UTILIZATION", "0.85")
             ),
-            enforce_eager=True,
+            enforce_eager=_enforce_eager,
         )
         self._sampling_params_cls = SamplingParams
         self._warned_hidden_ignored = False
