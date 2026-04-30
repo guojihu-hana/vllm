@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,8 +22,6 @@ logger = init_logger(__name__)
 @dataclass
 class DraftRpcResponse:
     draft_token_ids: list[list[int]]
-    server_elapsed_ms: float = 0.0
-    rpc_round_trip_ms: float = 0.0
     payload_bytes: int = 0
 
 
@@ -45,13 +41,10 @@ class DraftRpcClient:
         self._socket.close(linger=0)
 
     def _request_once(self, payload: dict[str, Any]) -> DraftRpcResponse:
-        t0 = time.perf_counter()
         encoded_payload = msgspec.msgpack.encode(payload)
         self._socket.send(encoded_payload)
         raw = self._socket.recv()
         resp = msgspec.msgpack.decode(raw, type=DraftRpcResponse)
-        # Attach round-trip time for communication/decode-side attribution.
-        resp.rpc_round_trip_ms = (time.perf_counter() - t0) * 1000.0
         resp.payload_bytes = len(encoded_payload)
         return resp
 
@@ -90,15 +83,6 @@ class DraftRemoteProposer(DraftModelProposer):
             timeout_ms=spec_cfg.remote_draft_rpc_timeout_ms,
             max_retries=spec_cfg.remote_draft_max_retries,
         )
-        self._timing_log_interval = int(
-            os.environ.get("VLLM_REMOTE_DRAFT_TIMING_LOG_INTERVAL", "50")
-        )
-        self._timing_calls = 0
-        self._sum_target_prepare_ms = 0.0
-        self._sum_rpc_round_trip_ms = 0.0
-        self._sum_server_elapsed_ms = 0.0
-        self._sum_comm_ms = 0.0
-        self._sum_payload_bytes = 0
         logger.info(
             "Initialized remote draft proposer endpoint=%s timeout_ms=%d retries=%d",
             spec_cfg.remote_draft_endpoint,
@@ -164,32 +148,6 @@ class DraftRemoteProposer(DraftModelProposer):
                 include_target_hidden_states=not omit_target_hs_payload,
             )
             resp = self.rpc_client.propose(payload)
-            rpc_round_trip_ms = float(getattr(resp, "rpc_round_trip_ms", 0.0))
-            server_elapsed_ms = float(getattr(resp, "server_elapsed_ms", 0.0))
-            comm_ms = max(0.0, rpc_round_trip_ms - server_elapsed_ms)
-            payload_bytes = int(getattr(resp, "payload_bytes", 0))
-            target_prepare_ms = float(
-                getattr(self._runner, "_remote_draft_target_prepare_ms", 0.0)
-            )
-            self._timing_calls += 1
-            self._sum_target_prepare_ms += target_prepare_ms
-            self._sum_rpc_round_trip_ms += rpc_round_trip_ms
-            self._sum_server_elapsed_ms += server_elapsed_ms
-            self._sum_comm_ms += comm_ms
-            self._sum_payload_bytes += payload_bytes
-            if self._timing_calls % self._timing_log_interval == 0:
-                n = float(self._timing_calls)
-                logger.info(
-                    "Remote draft timing avg over %d calls: "
-                    "target_prepare=%.3f ms, draft_generate=%.3f ms, communication=%.3f ms "
-                    "(rpc_round_trip=%.3f ms, payload_bytes=%.1f)",
-                    self._timing_calls,
-                    self._sum_target_prepare_ms / n,
-                    self._sum_server_elapsed_ms / n,
-                    self._sum_comm_ms / n,
-                    self._sum_rpc_round_trip_ms / n,
-                    self._sum_payload_bytes / n,
-                )
             tokens = torch.tensor(resp.draft_token_ids,
                                   dtype=torch.int64,
                                   device=self.device)

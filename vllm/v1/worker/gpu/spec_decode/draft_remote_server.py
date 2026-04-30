@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -62,17 +61,17 @@ class DraftRemoteServer:
 
     def serve_once(self) -> None:
         raw = self.socket.recv()
-        t0 = time.perf_counter()
         req = msgspec.msgpack.decode(raw, type=dict[str, Any])
-        if req.get("rpc_schema") == DRAFT_PROPOSE_V1:
-            if not getattr(self.propose_fn, "accepts_rpc_dict", False):
-                raise ValueError(
-                    "Received draft_propose_v1 RPC but this worker backend does not "
-                    "implement native parity decoding. Start draft_remote_server.py "
-                    "with --backend native --target-model ... --model <draft>."
-                )
-            draft_token_ids = self.propose_fn(req)
-        else:
+
+        def run_propose() -> list[list[int]]:
+            if req.get("rpc_schema") == DRAFT_PROPOSE_V1:
+                if not getattr(self.propose_fn, "accepts_rpc_dict", False):
+                    raise ValueError(
+                        "Received draft_propose_v1 RPC but this worker backend does not "
+                        "implement native parity decoding. Start draft_remote_server.py "
+                        "with --backend native --target-model ... --model <draft>."
+                    )
+                return self.propose_fn(req)
             next_token_ids = list(req.get("next_token_ids", []))
             num_speculative_tokens = int(req.get("num_speculative_tokens", 1))
             ctx = req.get("context_token_ids")
@@ -90,15 +89,17 @@ class DraftRemoteServer:
                 target_hidden_states = torch.frombuffer(
                     bytes(hs_bytes), dtype=torch.float16
                 ).reshape(hs_shape).clone()
-            draft_token_ids = self.propose_fn(
+            return self.propose_fn(
                 next_token_ids,
                 num_speculative_tokens,
                 context_token_ids=ctx,
                 target_hidden_states=target_hidden_states,
             )
+
+        draft_token_ids = run_propose()
+
         resp = {
             "draft_token_ids": draft_token_ids,
-            "server_elapsed_ms": (time.perf_counter() - t0) * 1000.0,
         }
         self.socket.send(msgspec.msgpack.encode(resp))
 

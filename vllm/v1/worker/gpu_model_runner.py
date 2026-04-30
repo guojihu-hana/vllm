@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -197,6 +198,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
+from vllm.v1.worker.timer import SpecDecodeTimingTracker
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -861,6 +863,18 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        # Spec decode timing (timestamps come from logger format).
+        # Log only on TP0 + last PP rank to avoid duplicated per-rank logs.
+        self._spec_timing = SpecDecodeTimingTracker(
+            enabled=self.speculative_config is not None
+            and (get_tp_group().rank_in_group == 0 and get_pp_group().is_last_rank)
+            and self.device.type == "cuda",
+            log_interval=int(
+                os.environ.get("VLLM_SPEC_DECODE_TIMING_LOG_INTERVAL", "50")
+            ),
+            log_fn=logger.info,
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -4036,13 +4050,16 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with self._spec_timing.target_timer(
+                enabled=use_spec_decode,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4192,17 +4209,18 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    slot_mappings,
-                )
+                with self._spec_timing.draft_timer():
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        slot_mappings,
+                    )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -4680,11 +4698,6 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | DraftRemoteProposer,
             )
-            remote_target_prepare_t0 = (
-                time.perf_counter()
-                if isinstance(self.drafter, DraftRemoteProposer)
-                else None
-            )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4795,15 +4808,10 @@ class GPUModelRunner(
             )
             if isinstance(self.drafter, DraftRemoteProposer):
                 self._remote_draft_propose_sampled_token_ids = sampled_token_ids
-                if remote_target_prepare_t0 is not None:
-                    self._remote_draft_target_prepare_ms = (
-                        time.perf_counter() - remote_target_prepare_t0
-                    ) * 1000.0
                 try:
                     draft_token_ids = self.drafter.propose(**propose_kwargs)
                 finally:
                     self._remote_draft_propose_sampled_token_ids = None
-                    self._remote_draft_target_prepare_ms = 0.0
             else:
                 draft_token_ids = self.drafter.propose(**propose_kwargs)
             # print(draft_token_ids, len(draft_token_ids), draft_token_ids.shape)
