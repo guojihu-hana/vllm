@@ -123,11 +123,10 @@ def _parse_args() -> argparse.Namespace:
         "--backend",
         type=str,
         default="native",
-        choices=("native", "vllm", "hf"),
+        choices=("native", "vllm"),
         help=(
             "Draft inference backend: native uses DraftModelProposer parity RPC "
-            "(draft_propose_v1); vllm uses LLM.generate greedy replay; hf uses "
-            "transformers."
+            "(draft_propose_v1); vllm uses LLM.generate greedy replay."
         ),
     )
     p.add_argument(
@@ -193,7 +192,6 @@ def main() -> None:
 
     if args.model:
         from vllm.v1.worker.gpu.spec_decode.draft_remote_inference import (
-            HFTransformersDraftFn,
             VLLMGreedyDraftFn,
         )
         from vllm.v1.worker.gpu.spec_decode.draft_remote_native import (
@@ -223,13 +221,6 @@ def main() -> None:
                 max_seq_len=args.max_seq_len,
                 dtype=dtype,
                 tensor_parallel_size=args.tensor_parallel_size,
-            )
-        else:
-            propose_fn = HFTransformersDraftFn(
-                args.model,
-                device=torch.device(args.device),
-                max_seq_len=args.max_seq_len,
-                dtype=dtype,
             )
     else:
         propose_fn = RepeatTokenDraftFn()
