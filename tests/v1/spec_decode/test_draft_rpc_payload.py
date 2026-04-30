@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 import threading
 
 import torch
@@ -11,6 +13,7 @@ from vllm.v1.worker.gpu.spec_decode.draft_remote_server import DraftRemoteServer
 from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import (
     DRAFT_PROPOSE_V1,
     build_draft_propose_v1_payload,
+    deserialize_draft_propose_v1,
     portable_common_attn_to_payload,
     rebuild_common_attn_metadata,
     tensor_chunk_from_payload,
@@ -107,6 +110,66 @@ def test_build_draft_propose_v1_payload_has_schema():
         num_speculative_tokens=2,
     )
     assert payload["rpc_schema"] == DRAFT_PROPOSE_V1
+
+
+def test_build_draft_propose_v1_payload_omits_hidden_for_draft_model_mode():
+    device = _device()
+    batch_spec = BatchSpec(seq_lens=[3, 2], query_lens=[3, 2])
+    cad = create_common_attn_metadata(
+        batch_spec, block_size=BLOCK_SIZE, device=device, arange_block_indices=True
+    )
+    tt = torch.randint(0, 100, (5,), device=device, dtype=torch.int32)
+    tp = torch.arange(5, device=device, dtype=torch.int64)
+    th = torch.randn(5, 64, dtype=torch.float16, device=device)
+    nt = torch.tensor([10, 20], dtype=torch.int32, device=device)
+    payload = build_draft_propose_v1_payload(
+        target_token_ids=tt,
+        target_positions=tp,
+        target_hidden_states=th,
+        next_token_ids=nt,
+        token_indices_to_sample=None,
+        common_attn_metadata=cad,
+        num_rejected_tokens_gpu=None,
+        num_speculative_tokens=2,
+        include_target_hidden_states=False,
+    )
+    assert "target_hidden_states" not in payload
+    ds = deserialize_draft_propose_v1(
+        payload,
+        device=device,
+        block_size=BLOCK_SIZE,
+        omit_target_hs_fill_hidden_size=64,
+        omit_target_hs_dtype=torch.float16,
+    )
+    assert ds.target_hidden_states.shape == (5, 64)
+    assert torch.all(ds.target_hidden_states == 0)
+
+
+def test_deserialize_missing_hs_requires_fill_dimensions():
+    device = _device()
+    batch_spec = BatchSpec(seq_lens=[3, 2], query_lens=[3, 2])
+    cad = create_common_attn_metadata(
+        batch_spec, block_size=BLOCK_SIZE, device=device, arange_block_indices=True
+    )
+    tt = torch.randint(0, 100, (5,), device=device, dtype=torch.int32)
+    tp = torch.arange(5, device=device, dtype=torch.int64)
+    th = torch.randn(5, 16, dtype=torch.float16, device=device)
+    nt = torch.tensor([10, 20], dtype=torch.int32, device=device)
+    payload = build_draft_propose_v1_payload(
+        target_token_ids=tt,
+        target_positions=tp,
+        target_hidden_states=th,
+        next_token_ids=nt,
+        token_indices_to_sample=None,
+        common_attn_metadata=cad,
+        num_rejected_tokens_gpu=None,
+        num_speculative_tokens=2,
+        include_target_hidden_states=False,
+    )
+    with pytest.raises(ValueError, match="omit_target_hs_fill_hidden_size"):
+        deserialize_draft_propose_v1(
+            payload, device=device, block_size=BLOCK_SIZE
+        )
 
 
 class DictDraftFn:

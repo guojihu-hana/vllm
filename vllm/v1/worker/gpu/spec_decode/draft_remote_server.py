@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -61,6 +62,7 @@ class DraftRemoteServer:
 
     def serve_once(self) -> None:
         raw = self.socket.recv()
+        t0 = time.perf_counter()
         req = msgspec.msgpack.decode(raw, type=dict[str, Any])
         if req.get("rpc_schema") == DRAFT_PROPOSE_V1:
             if not getattr(self.propose_fn, "accepts_rpc_dict", False):
@@ -94,7 +96,10 @@ class DraftRemoteServer:
                 context_token_ids=ctx,
                 target_hidden_states=target_hidden_states,
             )
-        resp = {"draft_token_ids": draft_token_ids}
+        resp = {
+            "draft_token_ids": draft_token_ids,
+            "server_elapsed_ms": (time.perf_counter() - t0) * 1000.0,
+        }
         self.socket.send(msgspec.msgpack.encode(resp))
 
 
@@ -150,6 +155,17 @@ def _parse_args() -> argparse.Namespace:
         choices=("auto", "float16", "bfloat16", "float32"),
         help="Weight dtype for HF load (default: auto / env VLLM_REMOTE_DRAFT_DTYPE).",
     )
+    p.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Draft worker tensor parallel size (default 1). Requires enough visible "
+            "GPUs. Not supported with --backend native when "
+            "VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1."
+        ),
+    )
     return p.parse_args()
 
 
@@ -199,12 +215,14 @@ def main() -> None:
                 num_speculative_tokens=num_spec,
                 max_model_len=args.max_seq_len,
                 dtype=_dtype_str_for_native(dtype),
+                tensor_parallel_size=args.tensor_parallel_size,
             )
         elif args.backend == "vllm":
             propose_fn = VLLMGreedyDraftFn(
                 args.model,
                 max_seq_len=args.max_seq_len,
                 dtype=dtype,
+                tensor_parallel_size=args.tensor_parallel_size,
             )
         else:
             propose_fn = HFTransformersDraftFn(

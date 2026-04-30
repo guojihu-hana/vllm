@@ -14,6 +14,14 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def remote_draft_tensor_parallel_size(explicit: int | None = None) -> int:
+    """Tensor parallel size for remote draft ``LLM`` / native parity worker."""
+    tp = 1 if explicit is None else explicit
+    if tp < 1:
+        raise ValueError(f"tensor_parallel_size must be >= 1, got {tp}")
+    return tp
+
+
 def _parse_dtype(name: str) -> torch.dtype | str:
     n = name.lower().strip()
     if n in ("auto", ""):
@@ -136,6 +144,7 @@ class VLLMGreedyDraftFn:
         model: str,
         max_seq_len: int | None = None,
         dtype: torch.dtype | str | None = None,
+        tensor_parallel_size: int | None = None,
     ) -> None:
         from vllm import LLM, SamplingParams
 
@@ -149,11 +158,13 @@ class VLLMGreedyDraftFn:
             )
         elif isinstance(resolved_dtype, str):
             resolved_dtype = _parse_dtype(resolved_dtype)
+        tp = remote_draft_tensor_parallel_size(tensor_parallel_size)
         logger.info(
-            "Loading remote draft vLLM engine %s (max_seq_len=%s, dtype=%s)",
+            "Loading remote draft vLLM engine %s (max_seq_len=%s, dtype=%s, tp=%d)",
             model,
             self.max_seq_len,
             resolved_dtype,
+            tp,
         )
         # Match draft_remote_native.build_vllm_config_for_native_remote_draft:
         # VLLM_REMOTE_DRAFT_ENFORCE_EAGER=0 disables eager (allows compile/CUDAGraph).
@@ -164,7 +175,7 @@ class VLLMGreedyDraftFn:
             trust_remote_code=True,
             max_model_len=self.max_seq_len,
             dtype=resolved_dtype,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tp,
             gpu_memory_utilization=float(
                 os.environ.get("VLLM_REMOTE_DRAFT_GPU_MEMORY_UTILIZATION", "0.85")
             ),

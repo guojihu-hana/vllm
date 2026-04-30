@@ -266,16 +266,31 @@ def build_draft_propose_v1_payload(
     num_rejected_tokens_gpu: torch.Tensor | None,
     num_speculative_tokens: int,
     context_token_ids: list[list[int]] | None = None,
+    include_target_hidden_states: bool = True,
 ) -> dict[str, Any]:
+    """Build ``draft_propose_v1`` RPC payload.
+
+    When ``include_target_hidden_states`` is False, the target LM hidden-state
+    tensor is not serialized (saves bandwidth and avoids D2H on the caller).
+    Remote workers must deserialize with ``omit_target_hs_fill_hidden_size``.
+    Typical use case: ``SpeculativeConfig.method == \"draft_model\"`` —
+    ``DraftModelProposer`` does not consume target hidden states in the draft
+    forward (``pass_hidden_states_to_model=False``); EAGLE-style methods keep
+    the default ``True``.
+    """
     payload: dict[str, Any] = {
         "rpc_schema": DRAFT_PROPOSE_V1,
         "num_speculative_tokens": num_speculative_tokens,
         "target_token_ids": tensor_chunk_to_payload(target_token_ids),
         "target_positions": tensor_chunk_to_payload(target_positions),
-        "target_hidden_states": tensor_chunk_to_payload(target_hidden_states.cpu()),
         "next_token_ids": tensor_chunk_to_payload(next_token_ids.cpu()),
         "common_attn_metadata": portable_common_attn_to_payload(common_attn_metadata),
     }
+    # ``DraftModelProposer`` does not pass hidden states into the draft forward
+    # (pass_hidden_states_to_model=False). For remote draft_model mode, omitting this
+    # tensor avoids enormous CPU/sync + Msgpack payloads (target LM hidden dim × tokens).
+    if include_target_hidden_states:
+        payload["target_hidden_states"] = tensor_chunk_to_payload(target_hidden_states.cpu())
     if context_token_ids is not None:
         payload["context_token_ids"] = context_token_ids
     if token_indices_to_sample is not None:
@@ -308,6 +323,8 @@ def deserialize_draft_propose_v1(
     block_size: int,
     *,
     num_kv_blocks: int | None = None,
+    omit_target_hs_fill_hidden_size: int | None = None,
+    omit_target_hs_dtype: torch.dtype | None = None,
 ) -> DraftProposeV1Deserialized:
     token_indices = None
     if req.get("token_indices_to_sample") is not None:
@@ -320,6 +337,10 @@ def deserialize_draft_propose_v1(
         num_rejected = tensor_chunk_from_payload(
             req["num_rejected_tokens_gpu"], device
         ).to(torch.int32)
+
+    target_token_ids = tensor_chunk_from_payload(req["target_token_ids"], device).to(
+        torch.int32
+    )
 
     target_positions = tensor_chunk_from_payload(req["target_positions"], device).to(
         torch.int64
@@ -339,12 +360,28 @@ def deserialize_draft_propose_v1(
         num_speculative_tokens=num_spec,
     )
 
+    th_payload = req.get("target_hidden_states")
+    num_tokens_rows = int(target_token_ids.shape[0])
+    if th_payload is not None:
+        target_hidden_states = tensor_chunk_from_payload(th_payload, device)
+    else:
+        if omit_target_hs_fill_hidden_size is None:
+            raise ValueError(
+                "draft_propose_v1 payload omitted target_hidden_states; pass "
+                "omit_target_hs_fill_hidden_size (+ optional omit_target_hs_dtype) "
+                "to deserialize."
+            )
+        dt_fill = omit_target_hs_dtype if omit_target_hs_dtype is not None else torch.float16
+        target_hidden_states = torch.zeros(
+            (num_tokens_rows, omit_target_hs_fill_hidden_size),
+            dtype=dt_fill,
+            device=device,
+        )
+
     return DraftProposeV1Deserialized(
-        target_token_ids=tensor_chunk_from_payload(req["target_token_ids"], device).to(
-            torch.int32
-        ),
+        target_token_ids=target_token_ids,
         target_positions=target_positions,
-        target_hidden_states=tensor_chunk_from_payload(req["target_hidden_states"], device),
+        target_hidden_states=target_hidden_states,
         next_token_ids=tensor_chunk_from_payload(req["next_token_ids"], device).to(
             torch.int32
         ),

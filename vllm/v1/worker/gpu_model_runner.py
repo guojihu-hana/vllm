@@ -4680,6 +4680,11 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | DraftRemoteProposer,
             )
+            remote_target_prepare_t0 = (
+                time.perf_counter()
+                if isinstance(self.drafter, DraftRemoteProposer)
+                else None
+            )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4790,10 +4795,15 @@ class GPUModelRunner(
             )
             if isinstance(self.drafter, DraftRemoteProposer):
                 self._remote_draft_propose_sampled_token_ids = sampled_token_ids
+                if remote_target_prepare_t0 is not None:
+                    self._remote_draft_target_prepare_ms = (
+                        time.perf_counter() - remote_target_prepare_t0
+                    ) * 1000.0
                 try:
                     draft_token_ids = self.drafter.propose(**propose_kwargs)
                 finally:
                     self._remote_draft_propose_sampled_token_ids = None
+                    self._remote_draft_target_prepare_ms = 0.0
             else:
                 draft_token_ids = self.drafter.propose(**propose_kwargs)
             # print(draft_token_ids, len(draft_token_ids), draft_token_ids.shape)

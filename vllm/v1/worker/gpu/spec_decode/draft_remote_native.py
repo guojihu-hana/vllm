@@ -44,6 +44,7 @@ from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec, init_attn_backend, 
 from vllm.v1.worker.gpu.spec_decode.draft_remote_inference import (
     VLLMGreedyDraftFn,
     _parse_dtype,
+    remote_draft_tensor_parallel_size,
 )
 from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import (
     DRAFT_PROPOSE_V1,
@@ -64,8 +65,11 @@ def build_vllm_config_for_native_remote_draft(
     num_speculative_tokens: int,
     max_model_len: int,
     dtype: str = "auto",
+    tensor_parallel_size: int | None = None,
 ) -> VllmConfig:
     """Construct VllmConfig matching speculative draft_model engine layout."""
+    tp = remote_draft_tensor_parallel_size(tensor_parallel_size)
+    parallel_config = ParallelConfig(tensor_parallel_size=tp)
     # Remote draft runs a new graph per RPC; torch.compile + piecewise CUDA graphs
     # can mis-match dynamic shapes and cause illegal memory access. Default eager.
     # Set VLLM_REMOTE_DRAFT_ENFORCE_EAGER=0 to try compilation (expert / perf only).
@@ -80,10 +84,11 @@ def build_vllm_config_for_native_remote_draft(
     )
     speculative_config = SpeculativeConfig(
         target_model_config=model_config,
-        target_parallel_config=ParallelConfig(),
+        target_parallel_config=parallel_config,
         model=draft_model,
         method="draft_model",
         num_speculative_tokens=num_speculative_tokens,
+        draft_tensor_parallel_size=tp,
     )
     device = DeviceConfig(device=current_platform.device_type)
     scheduler_config = SchedulerConfig(
@@ -109,7 +114,7 @@ def build_vllm_config_for_native_remote_draft(
         cache_config=cache_config,
         speculative_config=speculative_config,
         device_config=device,
-        parallel_config=ParallelConfig(),
+        parallel_config=parallel_config,
         load_config=LoadConfig(),
         scheduler_config=scheduler_config,
         attention_config=attention_config,
@@ -129,6 +134,7 @@ class DraftModelNativeParityFn:
         num_speculative_tokens: int,
         max_model_len: int | None = None,
         dtype: str = "auto",
+        tensor_parallel_size: int | None = None,
     ) -> None:
         self.target_model = target_model
         self.draft_model = draft_model
@@ -136,9 +142,19 @@ class DraftModelNativeParityFn:
         self.max_model_len = max_model_len or int(
             os.environ.get("VLLM_REMOTE_DRAFT_MAX_SEQ_LEN", "8192")
         )
+        self._tensor_parallel_size = remote_draft_tensor_parallel_size(
+            tensor_parallel_size
+        )
         self._use_eagle_parity = (
             os.environ.get("VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY", "0") == "1"
         )
+        if self._use_eagle_parity and self._tensor_parallel_size > 1:
+            raise ValueError(
+                "Native EAGLE parity (VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1) runs in a "
+                "single process and only supports tensor_parallel_size=1. For "
+                "multi-GPU draft TP, leave EAGLE parity off (default) or use "
+                "--backend vllm (greedy LLM replay)."
+            )
 
         if not torch.cuda.is_available():
             raise RuntimeError("DraftModelNativeParityFn requires CUDA.")
@@ -156,11 +172,13 @@ class DraftModelNativeParityFn:
                 draft_model,
                 max_seq_len=self.max_model_len,
                 dtype=resolved,
+                tensor_parallel_size=self._tensor_parallel_size,
             )
             logger.info(
                 "DraftModelNativeParityFn greedy-replay backend draft_model=%s "
-                "(set VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1 for DraftModelProposer)",
+                "tp=%d (set VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1 for DraftModelProposer)",
                 draft_model,
+                self._tensor_parallel_size,
             )
             return
 
@@ -170,6 +188,7 @@ class DraftModelNativeParityFn:
             num_speculative_tokens=num_speculative_tokens,
             max_model_len=self.max_model_len,
             dtype=dtype,
+            tensor_parallel_size=self._tensor_parallel_size,
         )
 
         # initialize_model_parallel() reads get_current_vllm_config(); set config first.
@@ -292,6 +311,8 @@ class DraftModelNativeParityFn:
             self.device,
             block_size=block_size,
             num_kv_blocks=self._kv_num_blocks,
+            omit_target_hs_fill_hidden_size=self.proposer.hidden_size,
+            omit_target_hs_dtype=self.proposer.dtype,
         )
 
         target_hs = deser.target_hidden_states.to(
