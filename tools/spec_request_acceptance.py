@@ -24,6 +24,7 @@ polls /metrics in a background thread during the blocking chat call to capture p
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
 import threading
@@ -31,7 +32,33 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
+
+
+PROMPT_POOL_PATH = Path(__file__).with_name("spec_request_acceptance_prompts.txt")
+
+
+def _load_prompt_pool_from_file(path: Path) -> list[str]:
+    if not path.exists():
+        raise RuntimeError(
+            f"Prompt pool file not found: {path}. "
+            "Please create it with one prompt per line."
+        )
+    prompts = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(prompts) < 100:
+        raise RuntimeError(
+            f"Prompt pool file {path} has {len(prompts)} prompts; need at least 100."
+        )
+    return prompts[:100]
+
+
+# Global fixed prompt list for batch requests.
+RANDOM_PROMPT_LIST: list[str] = _load_prompt_pool_from_file(PROMPT_POOL_PATH)
 
 
 @dataclass
@@ -157,7 +184,13 @@ def _pick_spec_counter_pair(counters: dict[str, float]) -> CounterPair:
 
 def _extract_text(resp: dict[str, Any]) -> str:
     try:
-        return str(resp["choices"][0]["message"]["content"])
+        choice0 = resp["choices"][0]
+        if isinstance(choice0, dict):
+            if "message" in choice0 and isinstance(choice0["message"], dict):
+                return str(choice0["message"].get("content", ""))
+            if "text" in choice0:
+                return str(choice0["text"])
+        return json.dumps(resp, ensure_ascii=False)
     except Exception:  # noqa: BLE001
         return json.dumps(resp, ensure_ascii=False)
 
@@ -536,13 +569,31 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--https", action="store_true")
-    ap.add_argument("-p", "--prompt", required=True)
+    ap.add_argument("-p", "--prompt", default=None)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="If > 1, send N independent chat requests concurrently.",
+    )
     ap.add_argument("--model", default=None, help="Optional model field in request.")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=-1)
-    ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--timeout", type=float, default=3000.0)
+    ap.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Max concurrent workers for batch mode (default: batch-size).",
+    )
+    ap.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Per-request retry count on timeout/network failures in batch mode.",
+    )
     ap.add_argument("--show-output", action="store_true")
     ap.add_argument(
         "--memory-profile",
@@ -568,6 +619,14 @@ def main() -> None:
         "Example: 0.05 for 50ms polling.",
     )
     args = ap.parse_args()
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be >= 1")
+    if args.concurrency is not None and args.concurrency < 1:
+        raise SystemExit("--concurrency must be >= 1")
+    if args.retries < 0:
+        raise SystemExit("--retries must be >= 0")
+    if args.batch_size == 1 and args.prompt is None:
+        raise SystemExit("Single-request mode requires --prompt.")
 
     scheme = "https" if args.https else "http"
     chat_url = f"{scheme}://{args.host}:{args.port}/v1/chat/completions"
@@ -580,15 +639,19 @@ def main() -> None:
     before_counters = _parse_prometheus_counters(before_text)
     before = _pick_spec_counter_pair(before_counters)
 
-    payload: dict[str, Any] = {
-        "messages": [{"role": "user", "content": args.prompt}],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-    }
-    if args.model:
-        payload["model"] = args.model
+    is_batch = args.batch_size > 1
+
+    def _build_chat_payload(prompt_text: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "messages": [{"role": "user", "content": prompt_text}],
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+        }
+        if args.model:
+            payload["model"] = args.model
+        return payload
 
     peak_holder: list[float | None] = [None]
     stop_peak = threading.Event()
@@ -604,9 +667,71 @@ def main() -> None:
         poll_thr.start()
 
     t0 = time.time()
+    batch_responses: list[dict[str, Any] | None] | None = None
     try:
         try:
-            resp = _get_json(chat_url, payload, timeout=args.timeout)
+            if is_batch:
+                if args.prompt is None:
+                    if args.batch_size > len(RANDOM_PROMPT_LIST):
+                        raise SystemExit(
+                            f"--batch-size {args.batch_size} exceeds RANDOM_PROMPT_LIST size "
+                            f"{len(RANDOM_PROMPT_LIST)}."
+                        )
+                    selected_prompts = RANDOM_PROMPT_LIST[:args.batch_size]
+                else:
+                    selected_prompts = [args.prompt] * args.batch_size
+
+                def _send_one(prompt_text: str) -> dict[str, Any]:
+                    last_err: Exception | None = None
+                    for _ in range(args.retries + 1):
+                        try:
+                            return _get_json(
+                                chat_url,
+                                _build_chat_payload(prompt_text),
+                                timeout=args.timeout,
+                            )
+                        except (urllib.error.URLError, TimeoutError) as e:
+                            last_err = e
+                    raise RuntimeError(
+                        f"request failed after {args.retries + 1} attempts: {last_err}"
+                    )
+
+                batch_responses = [None] * args.batch_size
+                max_workers = args.batch_size if args.concurrency is None else min(
+                    args.concurrency, args.batch_size
+                )
+                failed = 0
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers
+                ) as executor:
+                    futures = {
+                        executor.submit(_send_one, p): idx
+                        for idx, p in enumerate(selected_prompts)
+                    }
+                    for fut in concurrent.futures.as_completed(futures):
+                        idx = futures[fut]
+                        try:
+                            batch_responses[idx] = fut.result()
+                        except Exception as e:  # noqa: BLE001
+                            failed += 1
+                            print(
+                                f"[request_{idx}] failed: {e}",
+                                file=sys.stderr,
+                            )
+                if failed == args.batch_size:
+                    raise SystemExit(
+                        f"All batch requests failed. Try smaller --concurrency, "
+                        f"larger --timeout, or fewer --max-tokens."
+                    )
+                first_ok = next((r for r in batch_responses if r is not None), None)
+                assert first_ok is not None
+                resp = first_ok
+            else:
+                resp = _get_json(
+                    chat_url,
+                    _build_chat_payload(args.prompt),
+                    timeout=args.timeout,
+                )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise SystemExit(f"HTTP {e.code}: {body}") from e
@@ -735,7 +860,15 @@ def main() -> None:
 
     if args.show_output:
         print("\n=== model_output ===")
-        print(_extract_text(resp))
+        if is_batch:
+            assert batch_responses is not None
+            for idx, one_resp in enumerate(batch_responses):
+                if one_resp is None:
+                    print(f"[request_{idx}] <failed>")
+                else:
+                    print(f"[request_{idx}] {_extract_text(one_resp)}")
+        else:
+            print(_extract_text(resp))
 
 
 if __name__ == "__main__":

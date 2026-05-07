@@ -140,7 +140,7 @@ class DraftModelNativeParityFn:
         self.draft_model = draft_model
         self.num_speculative_tokens = num_speculative_tokens
         self.max_model_len = max_model_len or int(
-            os.environ.get("VLLM_REMOTE_DRAFT_MAX_SEQ_LEN", "8192")
+            os.environ.get("MAX_SEQ_LEN", "8192")
         )
         self._tensor_parallel_size = remote_draft_tensor_parallel_size(
             tensor_parallel_size

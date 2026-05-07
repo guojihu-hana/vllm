@@ -13,7 +13,10 @@ import torch
 import zmq
 
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import DRAFT_PROPOSE_V1
+from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import (
+    DRAFT_PROPOSE_V1,
+    DRAFT_PROPOSE_V2,
+)
 
 logger = init_logger(__name__)
 
@@ -64,12 +67,15 @@ class DraftRemoteServer:
         req = msgspec.msgpack.decode(raw, type=dict[str, Any])
 
         def run_propose() -> list[list[int]]:
-            if req.get("rpc_schema") == DRAFT_PROPOSE_V1:
+            schema = req.get("rpc_schema")
+            if schema in (DRAFT_PROPOSE_V1, DRAFT_PROPOSE_V2):
                 if not getattr(self.propose_fn, "accepts_rpc_dict", False):
                     raise ValueError(
-                        "Received draft_propose_v1 RPC but this worker backend does not "
-                        "implement native parity decoding. Start draft_remote_server.py "
-                        "with --backend native --target-model ... --model <draft>."
+                        f"Received {schema} RPC but this worker backend does not "
+                        "implement an rpc-dict propose_fn. Start "
+                        "draft_remote_server.py with --backend native "
+                        "--target-model ... --model <draft> (for v1) or "
+                        "--backend session --model <draft> (for v2)."
                     )
                 return self.propose_fn(req)
             next_token_ids = list(req.get("next_token_ids", []))
@@ -124,10 +130,12 @@ def _parse_args() -> argparse.Namespace:
         "--backend",
         type=str,
         default="native",
-        choices=("native", "vllm"),
+        choices=("native", "vllm", "session"),
         help=(
             "Draft inference backend: native uses DraftModelProposer parity RPC "
-            "(draft_propose_v1); vllm uses LLM.generate greedy replay."
+            "(draft_propose_v1); vllm uses LLM.generate greedy replay; "
+            "session is the v2 session-incremental greedy backend with prefix "
+            "caching reuse (handles draft_propose_v2)."
         ),
     )
     p.add_argument(
@@ -193,6 +201,7 @@ def main() -> None:
 
     if args.model:
         from vllm.v1.worker.gpu.spec_decode.draft_remote_inference import (
+            SessionGreedyDraftFn,
             VLLMGreedyDraftFn,
         )
         from vllm.v1.worker.gpu.spec_decode.draft_remote_native import (
@@ -223,6 +232,15 @@ def main() -> None:
                 dtype=dtype,
                 tensor_parallel_size=args.tensor_parallel_size,
             )
+        elif args.backend == "session":
+            propose_fn = SessionGreedyDraftFn(
+                args.model,
+                max_seq_len=args.max_seq_len,
+                dtype=dtype,
+                tensor_parallel_size=args.tensor_parallel_size,
+            )
+        else:
+            raise ValueError(f"Unknown backend: {args.backend!r}")
     else:
         propose_fn = RepeatTokenDraftFn()
         logger.warning(

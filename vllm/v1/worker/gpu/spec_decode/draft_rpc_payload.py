@@ -1,7 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Msgpack-friendly serialization for DraftModel parity RPC (draft_propose_v1)."""
+"""Msgpack-friendly serialization for DraftModel parity RPC.
+
+Two protocol versions coexist:
+
+- ``draft_propose_v1``: stateless. Each RPC carries the full per-request token
+  history in ``context_token_ids`` (or full target tensors for EAGLE parity).
+  Bandwidth is O(seq_len × batch) per step.
+- ``draft_propose_v2``: session-aware. Target maintains a per-request session
+  id; first call sends the full prompt, subsequent calls send only the
+  ``tokens`` accepted/sampled since the previous step. The remote server
+  reconstructs the full sequence and relies on vLLM prefix caching for KV
+  reuse, so per-step bandwidth and prefill compute drop to O(K_accepted+1).
+"""
 
 from __future__ import annotations
 
@@ -14,6 +26,68 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
 DRAFT_PROPOSE_V1 = "draft_propose_v1"
+DRAFT_PROPOSE_V2 = "draft_propose_v2"
+
+
+@dataclass
+class DraftSessionEntry:
+    """One per-request entry in a ``draft_propose_v2`` payload.
+
+    ``is_first`` marks a fresh session (or one the server may have evicted):
+    ``tokens`` is then the complete prompt + first sampled token. Otherwise
+    ``tokens`` is the delta accepted/sampled by the target since the previous
+    step (length == accepted_count + 1 in the common case).
+    """
+
+    id: str
+    is_first: bool
+    tokens: list[int]
+
+
+def build_draft_propose_v2_payload(
+    *,
+    num_speculative_tokens: int,
+    sessions: list[DraftSessionEntry],
+    evict: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a ``draft_propose_v2`` RPC payload."""
+    payload: dict[str, Any] = {
+        "rpc_schema": DRAFT_PROPOSE_V2,
+        "num_speculative_tokens": int(num_speculative_tokens),
+        "sessions": [
+            {"id": s.id, "is_first": bool(s.is_first), "tokens": list(s.tokens)}
+            for s in sessions
+        ],
+    }
+    if evict:
+        payload["evict"] = list(evict)
+    return payload
+
+
+def parse_draft_propose_v2_payload(
+    req: dict[str, Any],
+) -> tuple[int, list[DraftSessionEntry], list[str]]:
+    """Parse a ``draft_propose_v2`` RPC payload.
+
+    Returns ``(num_speculative_tokens, sessions, evict_ids)``.
+    """
+    if req.get("rpc_schema") != DRAFT_PROPOSE_V2:
+        raise ValueError(
+            f"Expected rpc_schema={DRAFT_PROPOSE_V2!r}, got "
+            f"{req.get('rpc_schema')!r}"
+        )
+    raw_sessions = req.get("sessions") or []
+    sessions: list[DraftSessionEntry] = []
+    for s in raw_sessions:
+        sessions.append(
+            DraftSessionEntry(
+                id=str(s["id"]),
+                is_first=bool(s.get("is_first", False)),
+                tokens=[int(t) for t in (s.get("tokens") or [])],
+            )
+        )
+    evict = [str(x) for x in (req.get("evict") or [])]
+    return int(req["num_speculative_tokens"]), sessions, evict
 
 
 def _dtype_to_str(dt: torch.dtype) -> str:

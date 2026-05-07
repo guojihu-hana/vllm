@@ -12,8 +12,12 @@ from vllm.v1.spec_decode.draft_remote import DraftRpcClient
 from vllm.v1.worker.gpu.spec_decode.draft_remote_server import DraftRemoteServer
 from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import (
     DRAFT_PROPOSE_V1,
+    DRAFT_PROPOSE_V2,
+    DraftSessionEntry,
     build_draft_propose_v1_payload,
+    build_draft_propose_v2_payload,
     deserialize_draft_propose_v1,
+    parse_draft_propose_v2_payload,
     portable_common_attn_to_payload,
     rebuild_common_attn_metadata,
     tensor_chunk_from_payload,
@@ -264,5 +268,126 @@ def test_draft_remote_rpc_v1_dict_dispatch():
     assert len(resp.draft_token_ids) == 2
     assert all(len(row) == 3 for row in resp.draft_token_ids)
     t.join(timeout=5)
+    client.close()
+    server.close()
+
+
+def test_build_parse_draft_propose_v2_roundtrip():
+    sessions = [
+        DraftSessionEntry(id="r0", is_first=True, tokens=[1, 2, 3, 4]),
+        DraftSessionEntry(id="r1", is_first=False, tokens=[7]),
+    ]
+    payload = build_draft_propose_v2_payload(
+        num_speculative_tokens=3,
+        sessions=sessions,
+        evict=["r9"],
+    )
+    assert payload["rpc_schema"] == DRAFT_PROPOSE_V2
+    assert payload["num_speculative_tokens"] == 3
+    assert payload["evict"] == ["r9"]
+    assert payload["sessions"][0] == {
+        "id": "r0",
+        "is_first": True,
+        "tokens": [1, 2, 3, 4],
+    }
+
+    k, parsed_sessions, evict = parse_draft_propose_v2_payload(payload)
+    assert k == 3
+    assert evict == ["r9"]
+    assert [s.id for s in parsed_sessions] == ["r0", "r1"]
+    assert parsed_sessions[0].is_first is True
+    assert parsed_sessions[0].tokens == [1, 2, 3, 4]
+    assert parsed_sessions[1].is_first is False
+    assert parsed_sessions[1].tokens == [7]
+
+
+def test_parse_draft_propose_v2_rejects_wrong_schema():
+    bad = {
+        "rpc_schema": DRAFT_PROPOSE_V1,
+        "num_speculative_tokens": 1,
+        "sessions": [],
+    }
+    with pytest.raises(ValueError, match=DRAFT_PROPOSE_V2):
+        parse_draft_propose_v2_payload(bad)
+
+
+class _StubSessionFn:
+    """Test-only session backend: no LLM, just records and replays."""
+
+    accepts_rpc_dict = True
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, list[int]] = {}
+        self.calls: list[tuple[list[str], list[str]]] = []
+
+    def __call__(self, req):
+        k, sessions, evict = parse_draft_propose_v2_payload(req)
+        for sid in evict:
+            self.sessions.pop(sid, None)
+        order = []
+        for s in sessions:
+            if s.is_first:
+                self.sessions[s.id] = list(s.tokens)
+            else:
+                self.sessions[s.id].extend(s.tokens)
+            order.append(s.id)
+        self.calls.append((order, list(evict)))
+        # Echo session id length as drafts (deterministic + observable).
+        return [
+            [self.sessions[sid][-1]] * k for sid in order
+        ]
+
+
+def test_session_lifecycle_via_rpc():
+    import random
+
+    port = random.randint(40000, 49999)
+    endpoint = f"tcp://127.0.0.1:{port}"
+    fn = _StubSessionFn()
+    server = DraftRemoteServer(endpoint, propose_fn=fn)
+    serve_thread = threading.Thread(
+        target=lambda: [server.serve_once() for _ in range(3)], daemon=True
+    )
+    serve_thread.start()
+
+    client = DraftRpcClient(endpoint=endpoint, timeout_ms=5000, max_retries=0)
+    # Step 1: two new sessions.
+    p1 = build_draft_propose_v2_payload(
+        num_speculative_tokens=2,
+        sessions=[
+            DraftSessionEntry(id="a", is_first=True, tokens=[10, 11, 12]),
+            DraftSessionEntry(id="b", is_first=True, tokens=[20, 21]),
+        ],
+    )
+    r1 = client.propose(p1)
+    assert r1.draft_token_ids == [[12, 12], [21, 21]]
+    assert fn.sessions["a"] == [10, 11, 12]
+    assert fn.sessions["b"] == [20, 21]
+
+    # Step 2: increments only.
+    p2 = build_draft_propose_v2_payload(
+        num_speculative_tokens=2,
+        sessions=[
+            DraftSessionEntry(id="a", is_first=False, tokens=[13]),
+            DraftSessionEntry(id="b", is_first=False, tokens=[22, 23]),
+        ],
+    )
+    r2 = client.propose(p2)
+    assert r2.draft_token_ids == [[13, 13], [23, 23]]
+    assert fn.sessions["a"] == [10, 11, 12, 13]
+    assert fn.sessions["b"] == [20, 21, 22, 23]
+
+    # Step 3: evict 'a', keep 'b'.
+    p3 = build_draft_propose_v2_payload(
+        num_speculative_tokens=2,
+        sessions=[DraftSessionEntry(id="b", is_first=False, tokens=[24])],
+        evict=["a"],
+    )
+    r3 = client.propose(p3)
+    assert r3.draft_token_ids == [[24, 24]]
+    assert "a" not in fn.sessions
+    assert fn.sessions["b"] == [20, 21, 22, 23, 24]
+
+    serve_thread.join(timeout=5)
     client.close()
     server.close()

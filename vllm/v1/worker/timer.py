@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -56,8 +57,9 @@ class SpecDecodeTimingTracker:
         self._log_fn = log_fn
 
         self._calls = 0
-        self._target_ms_sum = 0.0
-        self._draft_ms_sum = 0.0
+        self._window_size = 50
+        self._target_recent: deque[float] = deque(maxlen=self._window_size)
+        self._draft_recent: deque[float] = deque(maxlen=self._window_size)
         self._last_target_ms = 0.0
 
         self._target_start_event = (
@@ -98,18 +100,20 @@ class SpecDecodeTimingTracker:
         if not self.enabled:
             return
         self._calls += 1
-        self._draft_ms_sum += draft_ms
-        self._target_ms_sum += self._last_target_ms
+        self._draft_recent.append(draft_ms)
+        self._target_recent.append(self._last_target_ms)
         if self._calls % self.log_interval != 0:
             return
-        n = float(self._calls)
+        n = len(self._target_recent)
+        if n == 0:
+            return
+        target_avg = sum(self._target_recent) / n
+        draft_avg = sum(self._draft_recent) / n
         self._log_fn(
-            "Target total: %.3f ms, avg: %.3f ms (over %d calls); "
-            "Draft total: %.3f ms, avg: %.3f ms (over %d calls)",
-            self._target_ms_sum,
-            self._target_ms_sum / n,
-            self._calls,
-            self._draft_ms_sum,
-            self._draft_ms_sum / n,
-            self._calls,
+            "Target avg: %.3f ms (recent %d calls); "
+            "Draft avg: %.3f ms (recent %d calls)",
+            target_avg,
+            n,
+            draft_avg,
+            n,
         )

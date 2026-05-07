@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,9 +15,24 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import build_draft_propose_v1_payload
+from vllm.v1.worker.gpu.spec_decode.draft_rpc_payload import (
+    DraftSessionEntry,
+    build_draft_propose_v1_payload,
+    build_draft_propose_v2_payload,
+)
 
 logger = init_logger(__name__)
+
+
+def _use_session_protocol() -> bool:
+    """v2 (session-incremental) opt-in.
+
+    Default off so existing deployments keep using v1 until both target and
+    server are upgraded. Enable on both sides to drop per-step bandwidth from
+    O(seq_len × batch) to O(K_accepted+1 × batch) and let prefix caching reuse
+    KV across steps.
+    """
+    return os.environ.get("VLLM_REMOTE_DRAFT_USE_SESSION_PROTOCOL", "0") == "1"
 
 
 @dataclass
@@ -83,11 +99,17 @@ class DraftRemoteProposer(DraftModelProposer):
             timeout_ms=spec_cfg.remote_draft_rpc_timeout_ms,
             max_retries=spec_cfg.remote_draft_max_retries,
         )
+        # Session protocol state: req_id -> length of context already sent.
+        # Only populated when v2 protocol is active.
+        self._session_lengths: dict[str, int] = {}
+        self._use_session_protocol: bool = _use_session_protocol()
         logger.info(
-            "Initialized remote draft proposer endpoint=%s timeout_ms=%d retries=%d",
+            "Initialized remote draft proposer endpoint=%s timeout_ms=%d retries=%d "
+            "session_protocol=%s",
             spec_cfg.remote_draft_endpoint,
             spec_cfg.remote_draft_rpc_timeout_ms,
             spec_cfg.remote_draft_max_retries,
+            self._use_session_protocol,
         )
         if spec_cfg.method == "draft_model":
             logger.info(
@@ -149,19 +171,23 @@ class DraftRemoteProposer(DraftModelProposer):
                     seq = context_token_ids[i]
                     if not seq or seq[-1] != nt_int:
                         seq.append(nt_int)
-            payload = build_draft_propose_v1_payload(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                common_attn_metadata=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                num_speculative_tokens=self.num_speculative_tokens,
-                context_token_ids=context_token_ids,
-                include_target_hidden_states=not is_draft_model_mode,
-                omit_unused_for_greedy=is_draft_model_mode,
-            )
+
+            if is_draft_model_mode and self._use_session_protocol:
+                payload = self._build_v2_payload(context_token_ids)
+            else:
+                payload = build_draft_propose_v1_payload(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    common_attn_metadata=common_attn_metadata,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                    context_token_ids=context_token_ids,
+                    include_target_hidden_states=not is_draft_model_mode,
+                    omit_unused_for_greedy=is_draft_model_mode,
+                )
             resp = self.rpc_client.propose(payload)
             tokens = torch.tensor(resp.draft_token_ids,
                                   dtype=torch.int64,
@@ -176,3 +202,56 @@ class DraftRemoteProposer(DraftModelProposer):
                 f"expected {expected_shape}."
             )
         return tokens
+
+    def _build_v2_payload(
+        self, context_token_ids: list[list[int]]
+    ) -> dict[str, Any]:
+        """Build a session-incremental ``draft_propose_v2`` payload.
+
+        For each request: send the full context on the first step (or after a
+        gap), otherwise send only the suffix appended since the previous step.
+        Sessions for req_ids that left the batch are listed under ``evict``
+        so the server can free per-session state.
+        """
+        ib = self._runner.input_batch
+        num_reqs = ib.num_reqs
+        req_ids = list(ib.req_ids[:num_reqs])
+        if len(req_ids) != len(context_token_ids):
+            raise RuntimeError(
+                f"v2 session payload mismatch: req_ids={len(req_ids)} "
+                f"context_rows={len(context_token_ids)}"
+            )
+
+        sessions: list[DraftSessionEntry] = []
+        for sid, ctx in zip(req_ids, context_token_ids, strict=True):
+            prev_len = self._session_lengths.get(sid, 0)
+            cur_len = len(ctx)
+            if prev_len == 0 or prev_len > cur_len or ctx[:prev_len] is None:
+                # Fresh session, or our cached prefix length is stale (e.g.,
+                # server lost state across reconnect). Resend full context.
+                tokens = list(ctx)
+                is_first = True
+            else:
+                tokens = list(ctx[prev_len:])
+                is_first = False
+                if not tokens:
+                    # No new tokens since last step (rare: discard, no sample).
+                    # Still emit an entry so server preserves order; mark as
+                    # incremental with empty delta — server should re-issue
+                    # K drafts from cached state.
+                    pass
+            sessions.append(
+                DraftSessionEntry(id=sid, is_first=is_first, tokens=tokens)
+            )
+            self._session_lengths[sid] = cur_len
+
+        live = set(req_ids)
+        evict = [sid for sid in self._session_lengths if sid not in live]
+        for sid in evict:
+            del self._session_lengths[sid]
+
+        return build_draft_propose_v2_payload(
+            num_speculative_tokens=self.num_speculative_tokens,
+            sessions=sessions,
+            evict=evict or None,
+        )
