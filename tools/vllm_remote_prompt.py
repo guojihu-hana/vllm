@@ -35,7 +35,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # 在这里改默认配置最省事（命令行参数会覆盖）
 # ---------------------------------------------------------------------------
-DEFAULT_HOST = os.environ.get("VLLM_REMOTE_HOST", "100.101.93.30")
+DEFAULT_HOST = os.environ.get("VLLM_REMOTE_HOST", "100.102.141.147")
 DEFAULT_PORT = int(os.environ.get("VLLM_REMOTE_PORT", "8000"))
 DEFAULT_MODEL = os.environ.get("VLLM_REMOTE_MODEL") or ""
 
