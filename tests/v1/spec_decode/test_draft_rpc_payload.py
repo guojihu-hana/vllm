@@ -177,9 +177,9 @@ def test_build_draft_propose_v1_payload_omits_unused_for_greedy():
         "token_indices_to_sample",
         "num_rejected_tokens_gpu",
         "target_hidden_states",
+        "next_token_ids",
     ):
         assert key not in payload, f"{key} should be stripped for greedy mode"
-    assert payload["next_token_ids"] is not None
     assert payload["context_token_ids"] == [[1, 2, 3], [4, 5]]
     assert payload["num_speculative_tokens"] == 2
 

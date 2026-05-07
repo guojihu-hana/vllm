@@ -135,6 +135,20 @@ class DraftRemoteProposer(DraftModelProposer):
             is_draft_model_mode = (
                 self.speculative_config.method == "draft_model"
             )
+            if is_draft_model_mode:
+                # Server-side greedy backend will treat context[i][-1] as the
+                # request's "next token" (the token to start drafting from).
+                # ``gather_remote_draft_context_token_ids`` already does this in
+                # the common path, but for partial-prefill / all-PLACEHOLDER
+                # samples it falls back to ``backup_next_token_ids`` via the
+                # propose-arg ``next_token_ids``; patch those rows here so we
+                # can drop ``next_token_ids`` from the wire entirely.
+                nt_cpu = next_token_ids.detach().cpu().tolist()
+                for i, nt in enumerate(nt_cpu):
+                    nt_int = int(nt)
+                    seq = context_token_ids[i]
+                    if not seq or seq[-1] != nt_int:
+                        seq.append(nt_int)
             payload = build_draft_propose_v1_payload(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,

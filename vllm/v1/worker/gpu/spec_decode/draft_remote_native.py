@@ -291,15 +291,21 @@ class DraftModelNativeParityFn:
                     "draft_propose_v1 requires context_token_ids for greedy replay "
                     "(upgrade target vLLM worker)."
                 )
-            next_t = tensor_chunk_from_payload(
-                req["next_token_ids"], torch.device("cpu")
-            ).to(torch.int32)
-            next_list = [int(x) for x in next_t.view(-1).tolist()]
+            ctx_list = [[int(x) for x in row] for row in ctx]
+            if "next_token_ids" in req:
+                next_t = tensor_chunk_from_payload(
+                    req["next_token_ids"], torch.device("cpu")
+                ).to(torch.int32)
+                next_list = [int(x) for x in next_t.view(-1).tolist()]
+            else:
+                # omit_unused_for_greedy=True path: target patched context so
+                # context[i][-1] is the desired starting token.
+                next_list = [row[-1] if row else 0 for row in ctx_list]
             k = int(req["num_speculative_tokens"])
             return self._greedy_fn(
                 next_list,
                 k,
-                context_token_ids=[[int(x) for x in row] for row in ctx],
+                context_token_ids=ctx_list,
             )
 
         assert self.proposer is not None and self.vllm_config is not None

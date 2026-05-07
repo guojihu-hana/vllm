@@ -283,17 +283,21 @@ def build_draft_propose_v1_payload(
     replay backends (``VLLMGreedyDraftFn`` and ``DraftModelNativeParityFn``
     without ``VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1``) never read:
     ``target_token_ids``, ``target_positions``, ``common_attn_metadata``,
-    ``token_indices_to_sample``, ``num_rejected_tokens_gpu``. Each one of those
-    forces a D2H sync + msgpack encode on the target's critical path, so
-    skipping them removes both bandwidth and latency overhead. The native
-    EAGLE parity backend rejects payloads built with this flag.
+    ``token_indices_to_sample``, ``num_rejected_tokens_gpu``, and
+    ``next_token_ids``. Each one of those forces a D2H sync + msgpack encode on
+    the target's critical path, so skipping them removes both bandwidth and
+    latency overhead. The caller is responsible for ensuring each
+    ``context_token_ids[i]`` already ends with the desired starting token —
+    server-side greedy backends derive ``next_token_id`` from
+    ``context_token_ids[i][-1]``. The native EAGLE parity backend rejects
+    payloads built with this flag.
     """
     payload: dict[str, Any] = {
         "rpc_schema": DRAFT_PROPOSE_V1,
         "num_speculative_tokens": num_speculative_tokens,
-        "next_token_ids": tensor_chunk_to_payload(next_token_ids.cpu()),
     }
     if not omit_unused_for_greedy:
+        payload["next_token_ids"] = tensor_chunk_to_payload(next_token_ids.cpu())
         payload["target_token_ids"] = tensor_chunk_to_payload(target_token_ids)
         payload["target_positions"] = tensor_chunk_to_payload(target_positions)
         payload["common_attn_metadata"] = portable_common_attn_to_payload(
