@@ -267,6 +267,7 @@ def build_draft_propose_v1_payload(
     num_speculative_tokens: int,
     context_token_ids: list[list[int]] | None = None,
     include_target_hidden_states: bool = True,
+    omit_unused_for_greedy: bool = False,
 ) -> dict[str, Any]:
     """Build ``draft_propose_v1`` RPC payload.
 
@@ -277,15 +278,35 @@ def build_draft_propose_v1_payload(
     ``DraftModelProposer`` does not consume target hidden states in the draft
     forward (``pass_hidden_states_to_model=False``); EAGLE-style methods keep
     the default ``True``.
+
+    When ``omit_unused_for_greedy`` is True, also drops fields that the greedy
+    replay backends (``VLLMGreedyDraftFn`` and ``DraftModelNativeParityFn``
+    without ``VLLM_REMOTE_DRAFT_USE_EAGLE_PARITY=1``) never read:
+    ``target_token_ids``, ``target_positions``, ``common_attn_metadata``,
+    ``token_indices_to_sample``, ``num_rejected_tokens_gpu``. Each one of those
+    forces a D2H sync + msgpack encode on the target's critical path, so
+    skipping them removes both bandwidth and latency overhead. The native
+    EAGLE parity backend rejects payloads built with this flag.
     """
     payload: dict[str, Any] = {
         "rpc_schema": DRAFT_PROPOSE_V1,
         "num_speculative_tokens": num_speculative_tokens,
-        "target_token_ids": tensor_chunk_to_payload(target_token_ids),
-        "target_positions": tensor_chunk_to_payload(target_positions),
         "next_token_ids": tensor_chunk_to_payload(next_token_ids.cpu()),
-        "common_attn_metadata": portable_common_attn_to_payload(common_attn_metadata),
     }
+    if not omit_unused_for_greedy:
+        payload["target_token_ids"] = tensor_chunk_to_payload(target_token_ids)
+        payload["target_positions"] = tensor_chunk_to_payload(target_positions)
+        payload["common_attn_metadata"] = portable_common_attn_to_payload(
+            common_attn_metadata
+        )
+        if token_indices_to_sample is not None:
+            payload["token_indices_to_sample"] = tensor_chunk_to_payload(
+                token_indices_to_sample.cpu()
+            )
+        if num_rejected_tokens_gpu is not None:
+            payload["num_rejected_tokens_gpu"] = tensor_chunk_to_payload(
+                num_rejected_tokens_gpu.cpu()
+            )
     # ``DraftModelProposer`` does not pass hidden states into the draft forward
     # (pass_hidden_states_to_model=False). For remote draft_model mode, omitting this
     # tensor avoids enormous CPU/sync + Msgpack payloads (target LM hidden dim × tokens).
@@ -293,14 +314,6 @@ def build_draft_propose_v1_payload(
         payload["target_hidden_states"] = tensor_chunk_to_payload(target_hidden_states.cpu())
     if context_token_ids is not None:
         payload["context_token_ids"] = context_token_ids
-    if token_indices_to_sample is not None:
-        payload["token_indices_to_sample"] = tensor_chunk_to_payload(
-            token_indices_to_sample.cpu()
-        )
-    if num_rejected_tokens_gpu is not None:
-        payload["num_rejected_tokens_gpu"] = tensor_chunk_to_payload(
-            num_rejected_tokens_gpu.cpu()
-        )
     return payload
 
 
@@ -326,6 +339,14 @@ def deserialize_draft_propose_v1(
     omit_target_hs_fill_hidden_size: int | None = None,
     omit_target_hs_dtype: torch.dtype | None = None,
 ) -> DraftProposeV1Deserialized:
+    if "target_token_ids" not in req or "common_attn_metadata" not in req:
+        raise ValueError(
+            "draft_propose_v1 payload was built with omit_unused_for_greedy=True "
+            "(target_token_ids / common_attn_metadata stripped). EAGLE parity "
+            "deserialization needs them — either run the server with the greedy "
+            "backend (default) or have the caller pass omit_unused_for_greedy=False."
+        )
+
     token_indices = None
     if req.get("token_indices_to_sample") is not None:
         token_indices = tensor_chunk_from_payload(

@@ -538,7 +538,7 @@ def main() -> None:
     ap.add_argument("--https", action="store_true")
     ap.add_argument("-p", "--prompt", required=True)
     ap.add_argument("--model", default=None, help="Optional model field in request.")
-    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=-1)

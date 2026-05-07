@@ -132,7 +132,7 @@ class DraftRemoteProposer(DraftModelProposer):
 
         if is_tp_leader:
             context_token_ids = self._runner.gather_remote_draft_context_token_ids()
-            omit_target_hs_payload = (
+            is_draft_model_mode = (
                 self.speculative_config.method == "draft_model"
             )
             payload = build_draft_propose_v1_payload(
@@ -145,7 +145,8 @@ class DraftRemoteProposer(DraftModelProposer):
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 num_speculative_tokens=self.num_speculative_tokens,
                 context_token_ids=context_token_ids,
-                include_target_hidden_states=not omit_target_hs_payload,
+                include_target_hidden_states=not is_draft_model_mode,
+                omit_unused_for_greedy=is_draft_model_mode,
             )
             resp = self.rpc_client.propose(payload)
             tokens = torch.tensor(resp.draft_token_ids,

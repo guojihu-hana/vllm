@@ -145,6 +145,53 @@ def test_build_draft_propose_v1_payload_omits_hidden_for_draft_model_mode():
     assert torch.all(ds.target_hidden_states == 0)
 
 
+def test_build_draft_propose_v1_payload_omits_unused_for_greedy():
+    device = _device()
+    batch_spec = BatchSpec(seq_lens=[3, 2], query_lens=[3, 2])
+    cad = create_common_attn_metadata(
+        batch_spec, block_size=BLOCK_SIZE, device=device, arange_block_indices=True
+    )
+    tt = torch.randint(0, 100, (5,), device=device, dtype=torch.int32)
+    tp = torch.arange(5, device=device, dtype=torch.int64)
+    th = torch.randn(5, 64, dtype=torch.float16, device=device)
+    nt = torch.tensor([10, 20], dtype=torch.int32, device=device)
+    tis = torch.tensor([2, 4], dtype=torch.int32, device=device)
+    nrt = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    payload = build_draft_propose_v1_payload(
+        target_token_ids=tt,
+        target_positions=tp,
+        target_hidden_states=th,
+        next_token_ids=nt,
+        token_indices_to_sample=tis,
+        common_attn_metadata=cad,
+        num_rejected_tokens_gpu=nrt,
+        num_speculative_tokens=2,
+        context_token_ids=[[1, 2, 3], [4, 5]],
+        include_target_hidden_states=False,
+        omit_unused_for_greedy=True,
+    )
+    for key in (
+        "target_token_ids",
+        "target_positions",
+        "common_attn_metadata",
+        "token_indices_to_sample",
+        "num_rejected_tokens_gpu",
+        "target_hidden_states",
+    ):
+        assert key not in payload, f"{key} should be stripped for greedy mode"
+    assert payload["next_token_ids"] is not None
+    assert payload["context_token_ids"] == [[1, 2, 3], [4, 5]]
+    assert payload["num_speculative_tokens"] == 2
+
+    with pytest.raises(ValueError, match="omit_unused_for_greedy=True"):
+        deserialize_draft_propose_v1(
+            payload,
+            device=device,
+            block_size=BLOCK_SIZE,
+            omit_target_hs_fill_hidden_size=64,
+        )
+
+
 def test_deserialize_missing_hs_requires_fill_dimensions():
     device = _device()
     batch_spec = BatchSpec(seq_lens=[3, 2], query_lens=[3, 2])
