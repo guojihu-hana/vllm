@@ -4516,10 +4516,15 @@ class GPUModelRunner(
         the tail is taken from that tensor using the same filtering as
         :meth:`RejectionSampler.parse_output`. Conditioning on raw
         ``spec_token_ids`` alone would keep unaccepted draft tokens and
-        misalign the small model with the target.
+        misalign the small model with the target — the v2 session protocol
+        treats every emitted ctx as committed, so a single misaligned RPC
+        permanently desyncs the draft session.
 
-        Without post-rejection samples, build prompt + output + scheduled
-        ``spec_token_ids``, with a rare fallback to ``token_ids_cpu``.
+        When this step has no usable post-rejection sample for a request
+        (``discard=True`` or ``sampled is None``), the safe context is the
+        already-committed prefix only — ``base = prompt + output_token_ids``.
+        Splicing scheduled ``spec_token_ids`` here would feed the draft
+        unverified tokens that the target may reject this step.
         """
         ib = self.input_batch
         sampled = getattr(self, "_remote_draft_propose_sampled_token_ids", None)
@@ -4553,11 +4558,10 @@ class GPUModelRunner(
                 ]
                 seq = base + tail
             else:
-                seq = base + list(ib.spec_token_ids[i])
-                expected = ib._get_active_token_count(i)
-                if len(seq) != expected:
-                    row = ib.token_ids_cpu[i, :expected]
-                    seq = [int(row[j]) for j in range(expected)]
+                # discard=True or no sample available this step. Emit only the
+                # committed prefix; never splice unverified spec_token_ids,
+                # which would desync the persistent draft session.
+                seq = base
             out.append(seq)
         return out
 

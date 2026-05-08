@@ -130,12 +130,15 @@ def _parse_args() -> argparse.Namespace:
         "--backend",
         type=str,
         default="native",
-        choices=("native", "vllm", "session"),
+        choices=("native", "vllm", "session", "persistent"),
         help=(
             "Draft inference backend: native uses DraftModelProposer parity RPC "
             "(draft_propose_v1); vllm uses LLM.generate greedy replay; "
             "session is the v2 session-incremental greedy backend with prefix "
-            "caching reuse (handles draft_propose_v2)."
+            "caching reuse (handles draft_propose_v2); "
+            "persistent drives LLMEngine directly with one long-lived request "
+            "per session (handles draft_propose_v2, eliminates per-RPC request "
+            "creation overhead)."
         ),
     )
     p.add_argument(
@@ -201,6 +204,7 @@ def main() -> None:
 
     if args.model:
         from vllm.v1.worker.gpu.spec_decode.draft_remote_inference import (
+            PersistentEngineDraftFn,
             SessionGreedyDraftFn,
             VLLMGreedyDraftFn,
         )
@@ -235,6 +239,20 @@ def main() -> None:
         elif args.backend == "session":
             propose_fn = SessionGreedyDraftFn(
                 args.model,
+                max_seq_len=args.max_seq_len,
+                dtype=dtype,
+                tensor_parallel_size=args.tensor_parallel_size,
+            )
+        elif args.backend == "persistent":
+            num_spec = int(
+                os.environ.get(
+                    "VLLM_REMOTE_DRAFT_NUM_SPECULATIVE_TOKENS",
+                    os.environ.get("VLLM_REMOTE_NUM_SPECULATIVE_TOKENS", "1"),
+                )
+            )
+            propose_fn = PersistentEngineDraftFn(
+                args.model,
+                num_speculative_tokens=num_spec,
                 max_seq_len=args.max_seq_len,
                 dtype=dtype,
                 tensor_parallel_size=args.tensor_parallel_size,
